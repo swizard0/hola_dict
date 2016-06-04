@@ -1,6 +1,6 @@
 [package]
-name = "holadiv"
-version = "0.1.0"
+name = "hola_compiler"
+version = "0.1.1"
 authors = ["Alexey Voznyuk <me@swizard.info>"]
 
 [dependencies]
