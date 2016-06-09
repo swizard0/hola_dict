@@ -1,37 +1,40 @@
 extern crate getopts;
-extern crate byteorder;
 extern crate crossbeam;
+extern crate fnv;
+extern crate rand;
+extern crate mersenne_twister;
 
 use std::{io, env, process};
-use std::io::{Read, Write, Seek, SeekFrom, BufReader, Cursor};
-use std::fs::{File, OpenOptions};
+use std::io::{Write, BufReader, BufRead};
+use std::fs::File;
+use std::path::Path;
 use std::num::ParseIntError;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::collections::HashSet;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::hash::{Hash, Hasher};
+use rand::{Rng, SeedableRng};
 use getopts::{Options, Matches};
-use byteorder::{NativeEndian, ReadBytesExt, WriteBytesExt};
+
+use fnv::FnvHasher;
+use mersenne_twister::MT19937;
 
 #[derive(Debug)]
 enum CmdArgsError {
     Getopts(getopts::Fail),
-    NoInDbFileProvided,
+    NoWordsFileProvided,
     NoOutDbFileProvided,
-    NoCalcCacheFileProvided,
-    InvalidDivStartValue(String, ParseIntError),
+    InvalidBytesAvailValue(String, ParseIntError),
     InvalidThreadsValue(String, ParseIntError),
 }
 
 #[derive(Debug)]
 enum Error {
     CmdArgs(CmdArgsError),
-    InDbOpen(io::Error),
-    InDbMeta(io::Error),
-    InDbSeek(io::Error),
-    InDbRead(io::Error),
+    WordsOpen(io::Error),
+    WordsRead(io::Error),
     OutDbCreate(io::Error),
     OutDbWrite(io::Error),
-    CacheOpen(io::Error),
-    CacheRead(io::Error),
-    CacheWrite(io::Error),
 }
 
 fn entrypoint(maybe_matches: getopts::Result) -> Result<(), Error> {
@@ -39,158 +42,94 @@ fn entrypoint(maybe_matches: getopts::Result) -> Result<(), Error> {
     run(matches)
 }
 
+fn load_dict<P>(words_filename: P) -> Result<Vec<String>, Error> where P: AsRef<Path> {
+    let mut in_stream = BufReader::new(try!(File::open(words_filename).map_err(Error::WordsOpen)));
+    let mut seen = HashSet::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match in_stream.read_line(&mut line) {
+            Ok(0) =>
+                return Ok(seen.into_iter().collect()),
+            Ok(len) => {
+                let word = &line[0 .. len];
+                let key = word.trim_matches(|c: char| c.is_whitespace()).to_lowercase();
+                seen.insert(key);
+            },
+            Err(e) =>
+                return Err(Error::WordsRead(e)),
+        }
+    }
+}
+
 fn run(matches: Matches) -> Result<(), Error> {
-    let in_db_filename = try!(matches.opt_str("db-in").ok_or(Error::CmdArgs(CmdArgsError::NoInDbFileProvided)));
+    let words_filename = try!(matches.opt_str("words").ok_or(Error::CmdArgs(CmdArgsError::NoWordsFileProvided)));
     let out_db_filename = try!(matches.opt_str("db-out").ok_or(Error::CmdArgs(CmdArgsError::NoOutDbFileProvided)));
-    let calc_cache_filename = try!(matches.opt_str("calc-cache").ok_or(Error::CmdArgs(CmdArgsError::NoCalcCacheFileProvided)));
     let threads_count: usize = {
         let threads_str = matches.opt_str("threads").unwrap_or("4".to_string());
         try!(threads_str.parse().map_err(|e| Error::CmdArgs(CmdArgsError::InvalidThreadsValue(threads_str, e))))
     };
-    let div_start: usize = {
-        let div_start_str = matches.opt_str("div-start").unwrap_or("1".to_string());
-        try!(div_start_str.parse().map_err(|e| Error::CmdArgs(CmdArgsError::InvalidDivStartValue(div_start_str, e))))
+    let bytes_avail: usize = {
+        let bytes_avail_str = matches.opt_str("bytes-avail").unwrap_or("62000".to_string());
+        try!(bytes_avail_str.parse().map_err(|e| Error::CmdArgs(CmdArgsError::InvalidBytesAvailValue(bytes_avail_str, e))))
     };
 
-    let in_db = try!(File::open(&in_db_filename).map_err(Error::InDbOpen));
-    let metadata = try!(in_db.metadata().map_err(Error::InDbMeta));
-    let in_db_size = metadata.len();
-    let words_count = (in_db_size / 45000 / 4) as usize;
-    let mut in_db_r = BufReader::new(in_db);
+    println!("Running: words_filename = {}, out_db_filename = {}, threads_count = {}, bytes_avail = {}",
+             words_filename, out_db_filename, threads_count, bytes_avail);
 
-    let mut cache = try!(OpenOptions::new().read(true).write(true).create(true).open(&calc_cache_filename).map_err(Error::CacheOpen));
-    
-    println!("Running: in_db_filename = {} (size = {}, words = {}), out_db_filename = {}, calc_cache_filename = {}, threads_count = {}, div_start = {}",
-             in_db_filename, in_db_size, words_count, out_db_filename, calc_cache_filename, threads_count, div_start);
+    let dict = try!(load_dict(words_filename));
+    println!("Dictionary loaded: {} words, generating started ... ", dict.len());
 
-    let mut divs_found = Vec::new();
-    let mut min_div = std::i32::MAX;
-    let mut max_div = -1;
+    let rng: MT19937 = SeedableRng::from_seed(19650218u32);
+    let rng_mtx = Mutex::new(rng);
 
-    let chunk_size = 8000;
-    let chunk_limit = 32000 / chunk_size;
+    let out_bin: Vec<u8> = (0 .. bytes_avail).map(|_| 0).collect();
+    let out_bin_mtx = Mutex::new(out_bin);
 
-    let mut read_buf: Vec<u8> = (0 .. 45000 * 4).map(|_| 0).collect();
-
-    for chunk_index in 0 .. chunk_limit {
-        println!(" ;; READ chunk_index = {}/{} by {}, current min = {}, max = {}, divs_found = {}",
-                 chunk_index, chunk_limit, chunk_size, min_div, max_div, divs_found.len());
-
-        let mut seed_sample = Vec::with_capacity(chunk_size * words_count);
-
-        try!(in_db_r.seek(SeekFrom::Start(0u64)).map_err(Error::InDbSeek));
-        for _ in 0 .. words_count {
-            try!(in_db_r.read_exact(&mut read_buf).map_err(Error::InDbRead));
-            let mut curr = Cursor::new(&read_buf);
-            let offset = chunk_index as u64 * chunk_size as u64;
-            try!(curr.seek(SeekFrom::Start(offset * 4)).map_err(Error::InDbSeek));
-            for _chunk in 0 .. chunk_size {
-                let hash = try!(curr.read_i32::<NativeEndian>().map_err(Error::InDbRead));
-                seed_sample.push(hash);
-            }
-        }
-
-        for chunk in 0 .. chunk_size {
-
-            if chunk % 50 == 0 {
-                println!(" ;; RUN chunk_index = {}/{} by {}, chunk N{}, current min = {}, max = {}, divs_found = {}",
-                         chunk_index, chunk_limit, chunk_size, chunk, min_div, max_div, divs_found.len());
-            }
-
-            match cache.read_i32::<NativeEndian>() {
-                Ok(cached_div) => {
-                    if cached_div > 0 && cached_div < min_div {
-                        min_div = cached_div;
+    let bits_counter = AtomicUsize::new(0);
+    crossbeam::scope(|scope| {
+        for _ in 0 .. threads_count {
+            scope.spawn(|| {
+                loop {
+                    let bit_index = bits_counter.fetch_add(1, Ordering::Relaxed);
+                    if bit_index >= bytes_avail {
+                        break;
                     }
-                    if cached_div > 0 && cached_div > max_div {
-                        max_div = cached_div;
+
+                    let seed = rng_mtx.lock().unwrap().next_u32();
+                    if bit_index % 1024 == 0 {
+                        println!(" ;; currently generating bit index = {}, seed = {}", bit_index, seed);
                     }
-                    divs_found.push(cached_div);
-                    continue;
-                },
-                Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof =>
-                    (),
-                Err(e) =>
-                    return Err(Error::CacheRead(e)),
-            }
 
-            let mut zero_found = false;
-            for i in 0 .. words_count {
-                let hash = seed_sample[i * chunk_size + chunk];
-                if hash == 0 {
-                    zero_found = true;
-                    break;
-                }
-            }
-
-            if zero_found {
-                divs_found.push(0);
-                try!(cache.write_i32::<NativeEndian>(0).map_err(Error::CacheWrite));
-                try!(cache.flush().map_err(Error::CacheWrite));
-                continue;
-            }
-
-            let div = AtomicIsize::new(div_start as isize);
-            let pass = AtomicBool::new(false);
-            let rdiv = AtomicIsize::new(0);
-
-            crossbeam::scope(|scope| {
-                for _ in 0 .. threads_count {
-                    scope.spawn(|| {
-                        while !pass.load(Ordering::Relaxed) {
-                            let current_div = div.fetch_add(1, Ordering::Relaxed) as i32;
-                            // if current_div >= std::u16::MAX as i32 * 2 {
-                            //     pass.store(true, Ordering::SeqCst);
-                            //     rdiv.store(max_div as isize, Ordering::SeqCst);
-                            //     break;
-                            // }
-                            // if current_div % 1000 == 0 {
-                            //     println!(" ;; currently trying div = {}", current_div);
-                            // }
-
-                            let mut found = false;
-                            for i in 0 .. words_count {
-                                let hash = seed_sample[i * chunk_size + chunk];
-                                if hash % current_div == 0 {
-                                    found = true;
-                                    break;
-                                }
-                            }
-
-                            if !found {
-                                pass.store(true, Ordering::SeqCst);
-                                rdiv.store(current_div as isize, Ordering::SeqCst);
-                            }
+                    let mut more_zeros = 0;
+                    let mut more_ones = 0;
+                    for word in dict.iter() {
+                        let mut hasher = FnvHasher::default();
+                        seed.hash(&mut hasher);
+                        word.hash(&mut hasher);
+                        let hash = hasher.finish();
+                        if hash.count_ones() < 16 {
+                            more_zeros += 1;
+                        } else {
+                            more_ones += 1;
                         }
-                    });
+                    }
+
+                    if more_zeros < more_ones {
+                        let byte_pos = bit_index / 8;
+                        let bit_pos = bit_index % 8;
+                        let mask = 1 << bit_pos;
+                        let mut out_bin_lock = out_bin_mtx.lock().unwrap();
+                        out_bin_lock[byte_pos] |= mask;
+                    }
                 }
             });
-
-            let result_div = rdiv.load(Ordering::Relaxed) as i32;
-            if result_div < min_div {
-                min_div = result_div;
-            }
-            if result_div > max_div {
-                max_div = result_div;
-            }
-            divs_found.push(result_div);
-            try!(cache.write_i32::<NativeEndian>(result_div).map_err(Error::CacheWrite));
-            try!(cache.flush().map_err(Error::CacheWrite));
         }
-    }
-
-    println!("OVERALL base div = {}", min_div);
+    });
 
     let mut out_db = try!(File::create(out_db_filename).map_err(Error::OutDbCreate));
-    for div in divs_found {
-        let value = if div == 0 {
-            0
-        } else {
-            div - min_div + 1
-        };
-        assert!(value <= std::u16::MAX as i32);
-        try!(out_db.write_u16::<NativeEndian>(value as u16).map_err(Error::OutDbWrite));
-    }
+    let out_bin_lock = out_bin_mtx.lock().unwrap();
+    try!(out_db.write_all(&*out_bin_lock).map_err(Error::OutDbWrite));
 
     Ok(())
 }
@@ -200,11 +139,10 @@ fn main() {
     let cmd_proc = args.next().unwrap();
     let mut opts = Options::new();
 
-    opts.optopt("i", "db-in", "in file for input binary data db", "INDB");
+    opts.optopt("w", "words", "words dictionary", "WORDS");
     opts.optopt("o", "db-out", "output file for out binary data db", "OUTDB");
-    opts.optopt("c", "calc-cache", "cache file used during calculations", "CACHE");
+    opts.optopt("b", "bytes-avail", "binary data db max size in bytes (opt, default: 62000)", "BYTES");
     opts.optopt("t", "threads", "total concurrent threads to use (opt, default: 4)", "THREADS");
-    opts.optopt("d", "div-start", "div start value (opt, default: 1)", "DIVSTART");
     match entrypoint(opts.parse(args)) {
         Ok(()) => (),
         Err(cause) => {

@@ -1,9 +1,11 @@
 [package]
 name = "hola_compiler"
-version = "0.1.1"
+version = "0.2.0"
 authors = ["Alexey Voznyuk <me@swizard.info>"]
 
 [dependencies]
 crossbeam = "0.2"
-byteorder = "0.5"
 getopts = "0.2"
+fnv = "1.0"
+rand = "0.3"
+mersenne_twister = "0.3"
