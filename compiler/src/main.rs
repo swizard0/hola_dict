@@ -1,6 +1,5 @@
 extern crate getopts;
 extern crate crossbeam;
-extern crate fnv;
 extern crate rand;
 extern crate mersenne_twister;
 
@@ -15,9 +14,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::hash::{Hash, Hasher};
 use rand::{Rng, SeedableRng};
 use getopts::{Options, Matches};
-
-use fnv::FnvHasher;
 use mersenne_twister::MT19937;
+
+mod fnv32;
+use fnv32::FnvHasher32;
 
 #[derive(Debug)]
 enum CmdArgsError {
@@ -104,10 +104,10 @@ fn run(matches: Matches) -> Result<(), Error> {
                     let mut more_zeros = 0;
                     let mut more_ones = 0;
                     for word in dict.iter() {
-                        let mut hasher = FnvHasher::default();
+                        let mut hasher = FnvHasher32::default();
                         seed.hash(&mut hasher);
                         word.hash(&mut hasher);
-                        let hash = hasher.finish();
+                        let hash: u32 = hasher.finish() as u32;
                         if hash.count_ones() < 16 {
                             more_zeros += 1;
                         } else {
@@ -143,6 +143,7 @@ fn main() {
     opts.optopt("o", "db-out", "output file for out binary data db", "OUTDB");
     opts.optopt("b", "bytes-avail", "binary data db max size in bytes (opt, default: 62000)", "BYTES");
     opts.optopt("t", "threads", "total concurrent threads to use (opt, default: 4)", "THREADS");
+
     match entrypoint(opts.parse(args)) {
         Ok(()) => (),
         Err(cause) => {

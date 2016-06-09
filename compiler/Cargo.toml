@@ -6,6 +6,5 @@ authors = ["Alexey Voznyuk <me@swizard.info>"]
 [dependencies]
 crossbeam = "0.2"
 getopts = "0.2"
-fnv = "1.0"
 rand = "0.3"
 mersenne_twister = "0.3"
