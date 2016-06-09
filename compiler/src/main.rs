@@ -97,7 +97,7 @@ fn run(matches: Matches) -> Result<(), Error> {
                     }
 
                     let seed = rng_mtx.lock().unwrap().next_u32();
-                    if bit_index % 1024 == 0 {
+                    if bit_index % 8192 == 0 {
                         println!(" ;; currently generating bit index = {}, seed = {}", bit_index, seed);
                     }
 
