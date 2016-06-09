@@ -92,7 +92,7 @@ fn run(matches: Matches) -> Result<(), Error> {
             scope.spawn(|| {
                 loop {
                     let bit_index = bits_counter.fetch_add(1, Ordering::Relaxed);
-                    if bit_index >= bytes_avail {
+                    if bit_index >= bytes_avail * 8 {
                         break;
                     }
 
