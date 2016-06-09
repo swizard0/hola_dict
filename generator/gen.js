@@ -84,14 +84,17 @@ FNV.prototype = {
 }
 
 var gbuf = new Buffer(4);
+var fin = new Buffer(1);
 var fnv = new FNV;
 
 function magic_hash(word, rng) {
     let salt = rng.random_int();
-    gbuf.writeInt32BE(salt & 0xffffffff, 0);
+    gbuf.writeInt32LE(salt & 0xffffffff, 0);
     fnv.reset();
     fnv.update(gbuf);
     fnv.update(word);
+    fin[0] = 255;
+    fnv.update(fin);
     return fnv.value();
 }
 
@@ -106,7 +109,7 @@ function main(){
     }
 }
 
-main();
+// main();
 //process.exit(main()||0);
 
 
